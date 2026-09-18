@@ -1,4 +1,4 @@
-# 极域电子教室 UDP 重放攻击脚本
+# 图形化界面的极域电子教室 UDP 重放攻击脚本
 ![Uploading {3F1A6F9A-6983-4674-A4B8-500FDA0509E1}.png…](https://github.com/jikekei/jiyu_udp/blob/main/%7B3F1A6F9A-6983-4674-A4B8-500FDA0509E1%7D.png)
 
 ## 原理
